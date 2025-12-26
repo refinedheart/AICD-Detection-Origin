@@ -152,25 +152,10 @@ class ComputeLoss:
                 param.requires_grad = False
             self.teacher_model.eval()
             de_parallel(self.teacher_model).model[-1].train()
-            # 2. 蒸馏超参数（从 hyp 读取，方便调优）
-            # 1. 稍微提高总开关权重，让蒸馏起效
-            self.distill_w = h.get("distill_w", 1.0) 
-            # 2. 温度稍微调高一点点，使软标签更平滑
-            self.distill_temp = h.get("distill_temp", 3.0) 
-
-            self.distill_box_w = 0.05  # 降低框权重
-            self.distill_cls_w = 0.5   # 提高分类权重
-            self.distill_obj_w = 1.0   # 提高置信度权重
-
-            self.distill_cls_criterion = nn.KLDivLoss(reduction="batchmean") # 推荐用 batchmean
-            self.distill_box_criterion = nn.MSELoss(reduction="mean")
-            # [重要修改] 置信度改用 BCE，梯度更健康
-            self.distill_obj_criterion = nn.BCEWithLogitsLoss(reduction="mean")
-
-            # 4. 中间层特征蒸馏（可选，v5s→v5l 推荐开启，提升小模型特征提取能力）
-            self.feat_distill_enabled = h.get("feat_distill_enabled", True)
-            # [重要修改] 特征蒸馏权重降级，防止淹没主损失！
-            self.feat_distill_w = 0.005
+            self.fgfi_w = h.get("distill_w", 0.005) 
+            
+            # 开启特征蒸馏
+            self.feat_distill_enabled = True
             # YOLOv5 中间特征层：取 Detect 头前的 3 个多尺度特征层（P3、P4、P5，对应 model.model[17]、[20]、[23]，需根据 yaml 确认）
             self.student_feat_layers = [6, 8, 10]  # 学生模型的特征层索引（yolov5s.yaml 对应 C3 输出）
             self.teacher_feat_layers = [6, 8, 10]  # 教师模型的特征层索引（yolov5l.yaml 同架构，索引一致）
@@ -227,6 +212,52 @@ class ComputeLoss:
             if idx == layer_indices[-1]:  # 到最后一个特征层后停止，提升效率
                 break
         return feats
+
+    def get_fgfi_mask(self, batch_size, feat_h, feat_w, stride, targets, anchors_layer):
+        """生成 FGFI 掩码: 只在 GT 附近的 anchor 位置计算特征损失"""
+        mask = torch.zeros(batch_size, 1, feat_h, feat_w, device=self.device)
+        if len(targets) == 0: return mask
+
+        # 1. 准备所有 anchor 的坐标 (Grid Scale)
+        num_anchors = anchors_layer.shape[0]
+        grid_y, grid_x = torch.meshgrid([torch.arange(feat_h, device=self.device), torch.arange(feat_w, device=self.device)], indexing='ij')
+        grid_xy = torch.stack((grid_x, grid_y), 2).float() + 0.5
+        
+        # [H, W, A, 4] -> x, y, w, h
+        anchors_grid = torch.cat([
+            grid_xy.unsqueeze(2).expand(feat_h, feat_w, num_anchors, 2),
+            (anchors_layer / stride).view(1, 1, num_anchors, 2).expand(feat_h, feat_w, num_anchors, 2)
+        ], dim=-1).view(-1, 4) # Flatten [N_all, 4]
+
+        # 转为 x1y1x2y2
+        anchors_xyxy = torch.zeros_like(anchors_grid)
+        anchors_xyxy[:, 0], anchors_xyxy[:, 1] = anchors_grid[:, 0] - anchors_grid[:, 2]/2, anchors_grid[:, 1] - anchors_grid[:, 3]/2
+        anchors_xyxy[:, 2], anchors_xyxy[:, 3] = anchors_grid[:, 0] + anchors_grid[:, 2]/2, anchors_grid[:, 1] + anchors_grid[:, 3]/2
+
+        # 2. 遍历 Batch 计算 Mask
+        for b_idx in range(batch_size):
+            t = targets[targets[:, 0] == b_idx]
+            if len(t) == 0: continue
+            
+            # GT 转为 grid scale
+            gt_box = t[:, 2:6] * torch.tensor([feat_w, feat_h, feat_w, feat_h], device=self.device)
+            gt_xyxy = torch.zeros_like(gt_box)
+            gt_xyxy[:, 0], gt_xyxy[:, 1] = gt_box[:, 0] - gt_box[:, 2]/2, gt_box[:, 1] - gt_box[:, 3]/2
+            gt_xyxy[:, 2], gt_xyxy[:, 3] = gt_box[:, 0] + gt_box[:, 2]/2, gt_box[:, 1] + gt_box[:, 3]/2
+
+            # 计算 IoU: [N_anchors, N_gt]
+            ious = bbox_iou(anchors_xyxy.unsqueeze(1), gt_xyxy.unsqueeze(0), x1y1x2y2=True)
+            
+            # FGFI 阈值筛选: IoU > 0.5 * Max_IoU
+            max_iou_per_gt, _ = ious.max(dim=0)
+            thresholds = max_iou_per_gt * 0.5
+            active_anchors = (ious > thresholds.unsqueeze(0)).any(dim=1).float() # [N_anchors]
+            
+            # 还原为空间 Mask [H, W] (只要该位置有任意 anchor 被激活，该像素点就算激活)
+            mask[b_idx, 0] = active_anchors.view(feat_h, feat_w, num_anchors).max(dim=2)[0]
+            
+        return mask
+
     def __call__(self, p, targets, imgs=None):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
         lcls = torch.zeros(1, device=self.device)  # class loss
@@ -272,77 +303,41 @@ class ComputeLoss:
             if self.autobalance:
                 self.balance[i] = self.balance[i] * 0.9999 + 0.0001 / obji.detach().item()
                 # distill loss（只在训练阶段做；验证阶段直接跳过）
-        if self.distill_ok and imgs is not None and self.model.training:
-            # 确保输入给 teacher 的是 FP32
+        
+        
+        # FGFI 蒸馏逻辑
+        if self.distill_ok and self.model.training and imgs is not None:
             imgs_fp32 = imgs.float()
-
             with torch.no_grad():
-                # teacher forward 固定 FP32，并显式关掉 autocast
-                with torch.amp.autocast('cuda', enabled=False):
-                    teacher_p = self.teacher_model(imgs_fp32)
+                 # 只提取 Teacher 特征，不再需要 Teacher 的预测输出 (p)
+                teacher_feats = self._get_intermediate_feats(self.teacher_model, imgs_fp32, self.teacher_feat_layers)
+            
+            # 提取 Student 特征
+            student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs_fp32, self.student_feat_layers)
 
-                    # 教师中间特征（同样在 FP32 下）
-                    if self.feat_distill_enabled:
-                        teacher_feats = self._get_intermediate_feats(
-                            self.teacher_model, imgs_fp32, self.teacher_feat_layers
-                        )
-            for i, (student_pi, teacher_pi) in enumerate(zip(p, teacher_p)):
-                
-                b, a, gj, gi = indices[i]
-                n = b.shape[0]
-                if n == 0:
-                    continue  # 无目标层跳过，节省计算
-
-                # 3.1 提取学生/教师的目标位置预测（仅聚焦有真实目标的位置，提升效率）
-                # 学生预测
-                s_pxy, s_pwh, _, s_pcls = student_pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
-                s_obj = student_pi[b, a, gj, gi, 4:5]  # 置信度预测（logits）
-
-                # 教师预测（解码格式与学生完全一致）
-                t_pxy, t_pwh, _, t_pcls = teacher_pi[b, a, gj, gi].split((2, 2, 1, self.nc), 1)
-                t_obj = teacher_pi[b, a, gj, gi, 4:5]  # 教师置信度（logits）
-
-                # 3.2 框回归蒸馏（对齐解码后的真实框位置）
-                s_box = torch.cat([
-                    s_pxy.sigmoid() * 2 - 0.5,
-                    (s_pwh.sigmoid() * 2) ** 2 * anchors[i]
-                ], 1)
-                t_box = torch.cat([
-                    t_pxy.sigmoid() * 2 - 0.5,
-                    (t_pwh.sigmoid() * 2) ** 2 * anchors[i]
-                ], 1)
-                distill_box_loss = self.distill_box_criterion(s_box, t_box) * self.distill_box_w
-
-                # 3.3 分类蒸馏（KL散度 + 温度平滑，适配软标签）
-                s_cls_logsoftmax = F.log_softmax(s_pcls / self.distill_temp, dim=-1)
-                t_cls_softmax = F.softmax(t_pcls / self.distill_temp, dim=-1)
-                # 乘温度平方：抵消 KL 散度在高温度下的损失缩放（参考蒸馏原论文）
-                distill_cls_loss = self.distill_cls_criterion(s_cls_logsoftmax, t_cls_softmax) * (self.distill_temp ** 2) * self.distill_cls_w
-
-                # 3.4 置信度蒸馏（对齐 sigmoid 后的概率）
-                distill_obj_loss = self.distill_obj_criterion(
-                    s_obj, torch.sigmoid(t_obj)
-                ) * self.distill_obj_w
-
-                # 3.5 累加该层输出蒸馏损失
-                ldistill += (distill_box_loss + distill_cls_loss + distill_obj_loss) / 3  # 平均三项
-
-            # 4. 中间层特征蒸馏（对齐学生与教师的特征分布）
-            # if self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
-                # 获取学生中间层特征
-            #     student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs, self.student_feat_layers)
-            # 只在训练阶段做特征蒸馏（val/test 禁用）
-            if self.model.training and self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
-                student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs_fp32, self.student_feat_layers)
-
-                # 逐特征层计算蒸馏损失（MSE 对齐特征图）
-                for idx, (s_feat, t_feat, projector) in enumerate(zip(student_feats, teacher_feats, self.feat_projectors)):
+            # 计算 FGFI Loss
+            if len(student_feats) == len(teacher_feats):
+                for i, (s_feat, t_feat, projector) in enumerate(zip(student_feats, teacher_feats, self.feat_projectors)):
+                    # 1. 特征对齐
                     t_feat_proj = projector(t_feat)
                     if s_feat.shape[2:] != t_feat_proj.shape[2:]:
-                        t_feat_proj = F.interpolate(t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False)
-                    # 累加特征蒸馏损失
-                    lfeat_distill += F.mse_loss(s_feat, t_feat_proj)
+                         t_feat_proj = F.interpolate(t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False)
+                    
+                    # 2. 生成 Mask (基于当前层的 stride 和 anchors)
+                    B, C, H, W = s_feat.shape
+                    stride = imgs.shape[-1] / W
+                    mask = self.get_fgfi_mask(B, H, W, stride, targets, self.anchors[i])
+                    
+                    # 3. 计算 Masked MSE Loss
+                    diff = (s_feat - t_feat_proj) ** 2
+                    masked_diff = diff * mask
+                    # 归一化: 除以 Mask 中的正样本像素数，防止 loss 过大
+                    num_pos = mask.sum() * C + 1e-6 
+                    lfeat_distill += masked_diff.sum() / num_pos
 
+            # 乘以 FGFI 权重
+            lfeat_distill *= self.fgfi_w
+        
         if self.autobalance:
             self.balance = [x / self.balance[self.ssi] for x in self.balance]
         lbox *= self.hyp["box"]

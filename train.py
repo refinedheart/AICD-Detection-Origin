@@ -542,11 +542,12 @@ def train(hyp, opt, device, callbacks):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device), imgs=imgs)  # loss scaled by batch_size
                 # loss_items = (lbox, lobj, lcls, ldistill)
+                
                 if loss_items.numel() == 4:
-                    lbox, lobj, lcls, ldistill = loss_items
+                    lbox, lobj, lcls, lfgfi = loss_items
                 else:
                     lbox, lobj, lcls = loss_items
-                    ldistill = torch.tensor(0.0, device=loss.device)
+                    lfgfi = torch.tensor(0.0, device=loss.device)
 
                 global_step = ni  # 当前 batch 累计编号
 
