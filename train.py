@@ -24,9 +24,9 @@ import time
 from copy import deepcopy
 from datetime import datetime, timedelta
 from pathlib import Path
+
 # Add TensorBoard support
 from torch.utils.tensorboard import SummaryWriter
-
 
 try:
     import comet_ml  # must be imported before torch (if installed)
@@ -155,7 +155,7 @@ def train(hyp, opt, device, callbacks):
         opt.freeze,
     )
     callbacks.run("on_pretrain_routine_start")
-    
+
     # Initialize tensorboard writer
     writer = SummaryWriter(str(save_dir / "tensorboard"))
 
@@ -260,18 +260,17 @@ def train(hyp, opt, device, callbacks):
         teacher_model_path = opt.distill
         if not os.path.exists(teacher_model_path):
             raise FileNotFoundError(f"Teacher model not found: {teacher_model_path}")
-        
+
         # 加载教师模型（YOLOv5l），使用 YOLOv5 原生加载函数（兼容 .pt 权重）
         LOGGER.info(f"[Distillation] Enabling knowledge distillation with teacher model: {teacher_model_path}")
         teacher_model = attempt_load(teacher_model_path, device=device)  # 加载教师模型
         teacher_model.eval()  # 切换到评估模式（禁用 Dropout/BatchNorm 训练模式）
-        
+
         # 冻结教师模型所有参数（核心：避免教师模型被训练更新）
         for param in teacher_model.parameters():
             param.requires_grad = False
         LOGGER.info("[Distillation] Teacher model loaded and frozen successfully")
 
-        
         # 验证教师模型与学生模型的兼容性（类别数、锚点必须一致，否则蒸馏无意义）
         # 从教师模型中提取关键参数（兼容 YOLOv5 模型结构）
         teacher_model_de_parallel = de_parallel(teacher_model)
@@ -280,37 +279,39 @@ def train(hyp, opt, device, callbacks):
         try:
             # YOLOv5 的 Detect 层通常是模型的最后一个子模块
             teacher_detect_module = teacher_model_de_parallel.model[-1]
-            
+
             # 安全获取类别数
-            teacher_nc = teacher_detect_module.nc if hasattr(teacher_detect_module, 'nc') else nc
-                
+            teacher_nc = teacher_detect_module.nc if hasattr(teacher_detect_module, "nc") else nc
+
             # 安全获取锚点
             teacher_anchors = teacher_detect_module.anchors
-            
+
             # if not hasattr(teacher_detect_module, 'anchors'):
             #     LOGGER.warning("[Distillation] Teacher model Detect layer lacks 'anchors' attribute. Using student anchors as fallback.")
-                
+
         except Exception as e:
             # 异常处理：如果索引或属性获取失败，则回退到学生模型的设置
-            LOGGER.warning(f"[Distillation] Failed to find Detect layer info in teacher model: {e}. Falling back to student settings.")
+            LOGGER.warning(
+                f"[Distillation] Failed to find Detect layer info in teacher model: {e}. Falling back to student settings."
+            )
             teacher_nc = nc
             teacher_anchors = None
-        
+
         # 兼容性校验
         assert teacher_nc == nc, f"[Distillation] Teacher model class count ({teacher_nc}) != Student model ({nc})"
-        
+
         # 【修改关键行】：如果 teacher_anchors 为 None，则使用学生模型的 model.anchors (它现在已经赋值了)
         if teacher_anchors is None:
-             teacher_anchors = model.anchors
-             
+            teacher_anchors = model.anchors
+
         # 兼容性校验：现在 model.anchors 已经有值了，可以直接使用
         if teacher_anchors is not None and model.anchors is not None:
-             assert torch.allclose(teacher_anchors, model.anchors), "[Distillation] Teacher and student anchors do not match"
+            assert torch.allclose(teacher_anchors, model.anchors), (
+                "[Distillation] Teacher and student anchors do not match"
+            )
     else:
         LOGGER.info("[Distillation] Disabled (use --distill teacher_model.pt to enable)")
-    
 
-    
     compute_loss = ComputeLoss(model, autobalance=False, teacher_model=teacher_model)
 
     # Optimizer
@@ -319,7 +320,7 @@ def train(hyp, opt, device, callbacks):
     hyp["weight_decay"] *= batch_size * accumulate / nbs  # scale weight_decay
 
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
-    
+
     # 1. 模型参数
     for k, v in model.named_modules():
         if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
@@ -328,11 +329,11 @@ def train(hyp, opt, device, callbacks):
             pg0.append(v.weight)  # no decay
         elif hasattr(v, "weight") and isinstance(v.weight, nn.Parameter):
             pg1.append(v.weight)  # apply decay
-            
+
     # 2. [关键] 将 compute_loss 中的投影层参数加入优化器
     # 因为上面已经执行了 compute_loss = ComputeLoss(...)，所以这里不会报错了
     if hasattr(compute_loss, "feat_projectors"):
-        LOGGER.info(f"[Distill] Adding feature projectors to optimizer")
+        LOGGER.info("[Distill] Adding feature projectors to optimizer")
         for v in compute_loss.feat_projectors.modules():
             if hasattr(v, "bias") and isinstance(v.bias, nn.Parameter):
                 pg2.append(v.bias)
@@ -345,7 +346,7 @@ def train(hyp, opt, device, callbacks):
     optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
     # 此时 smart_optimizer 内部可能只加了 model.parameters() (取决于具体实现)，
     # 但我们手动构建了 pg0, pg1, pg2，所以通常建议手动创建 optimizer 如下：
-    
+
     # 如果 smart_optimizer 不支持传入 param_groups，建议直接使用 torch.optim
     if opt.optimizer == "Adam":
         optimizer = torch.optim.Adam(pg0, lr=hyp["lr0"], betas=(hyp["momentum"], 0.999))
@@ -359,7 +360,6 @@ def train(hyp, opt, device, callbacks):
     LOGGER.info(f"Optimizer groups: {len(pg2)} .bias, {len(pg0)} no decay, {len(pg1)} decay")
     del pg0, pg1, pg2
 
-
     # optimizer = smart_optimizer(model, opt.optimizer, hyp["lr0"], hyp["momentum"], hyp["weight_decay"])
     # if hasattr(compute_loss, "feat_projectors"):
     #     LOGGER.info(f"[Distill] Adding {len(compute_loss.feat_projectors)} feature projectors to optimizer")
@@ -367,7 +367,7 @@ def train(hyp, opt, device, callbacks):
     #         # 将 projector 的参数组添加到优化器中
     #         optimizer.add_param_group({
     #             'params': projector.parameters(),
-    #             'lr': hyp['lr0'], 
+    #             'lr': hyp['lr0'],
     #             'weight_decay': hyp['weight_decay']
     #         })
 
@@ -509,7 +509,10 @@ def train(hyp, opt, device, callbacks):
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
-        LOGGER.info(("\n" + "%11s" * 8) % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "distill", "Instances", "Size"))
+        LOGGER.info(
+            ("\n" + "%11s" * 8)
+            % ("Epoch", "GPU_mem", "box_loss", "obj_loss", "cls_loss", "distill", "Instances", "Size")
+        )
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
@@ -538,7 +541,7 @@ def train(hyp, opt, device, callbacks):
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             # Forward
-            with torch.amp.autocast('cuda', enabled=amp):
+            with torch.amp.autocast("cuda", enabled=amp):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device), imgs=imgs)  # loss scaled by batch_size
                 # loss_items = (lbox, lobj, lcls, ldistill)
@@ -683,10 +686,10 @@ def train(hyp, opt, device, callbacks):
         callbacks.run("on_train_end", last, best, epoch, results)
 
     torch.cuda.empty_cache()
-    
+
     # close tensorboard writer
     writer.close()
-    
+
     return results
 
 
@@ -696,7 +699,6 @@ def parse_opt(known=False):
     Args:
         known (bool, optional): If True, parses known arguments, ignoring the unknown. Defaults to False.
 
-        
     Returns:
         (argparse.Namespace): Parsed command-line arguments containing options for YOLOv5 execution.
 
@@ -764,10 +766,10 @@ def parse_opt(known=False):
 
     # Distill opt
     parser.add_argument(
-        "--distill", 
-        type=str, 
+        "--distill",
+        type=str,
         default="",  # 默认空字符串 → 关闭蒸馏
-        help="Enable knowledge distillation (specify teacher model path): --distill yolov5l.pt (empty=disable)"
+        help="Enable knowledge distillation (specify teacher model path): --distill yolov5l.pt (empty=disable)",
     )
 
     return parser.parse_known_args()[0] if known else parser.parse_args()
