@@ -246,8 +246,8 @@ class ComputeLoss:
             gt_xyxy[:, 2], gt_xyxy[:, 3] = gt_box[:, 0] + gt_box[:, 2]/2, gt_box[:, 1] + gt_box[:, 3]/2
 
             # 计算 IoU: [N_anchors, N_gt]
-            ious = bbox_iou(anchors_xyxy.unsqueeze(1), gt_xyxy.unsqueeze(0), x1y1x2y2=True)
-            
+            # ious = bbox_iou(anchors_xyxy.unsqueeze(1), gt_xyxy.unsqueeze(0), x1y1x2y2=True)
+            ious = bbox_iou(anchors_xyxy.unsqueeze(1), gt_xyxy.unsqueeze(0), xywh=False)
             # FGFI 阈值筛选: IoU > 0.5 * Max_IoU
             max_iou_per_gt, _ = ious.max(dim=0)
             thresholds = max_iou_per_gt * 0.5
