@@ -144,9 +144,9 @@ class ComputeLoss:
         self.device = device
 
         self.teacher_model = teacher_model
-        self.teacher_model.float()     # 强制 teacher 用 FP32
         self.distill_ok = self.teacher_model is not None
         if self.distill_ok:
+            self.teacher_model.float() 
             # 1. freezs teacher model
             for param in self.teacher_model.parameters():
                 param.requires_grad = False

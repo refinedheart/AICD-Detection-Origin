@@ -1,0 +1,21 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# BCCD (Blood Cell Count Detection) dataset - minimal YAML for YOLOv5
+# Usage example: python train.py --data data/BCCD.yaml
+
+# Dataset root (relative to repository root)
+path: ../datasets/BCCD
+
+# Image directories (after splitting):
+train: images/train
+val: images/val
+test: images/test
+
+# Number of classes
+nc: 3
+
+# Class names
+names:
+  0: RBC
+  1: WBC
+  2: Platelet
