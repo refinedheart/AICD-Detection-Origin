@@ -555,7 +555,8 @@ def train(hyp, opt, device, callbacks):
                 writer.add_scalar("loss/box", lbox.item(), global_step)
                 writer.add_scalar("loss/obj", lobj.item(), global_step)
                 writer.add_scalar("loss/cls", lcls.item(), global_step)
-                writer.add_scalar("loss/distill", (ldistill / batch_size).item(), global_step)
+                # writer.add_scalar("loss/distill", (ldistill / batch_size).item(), global_step)
+                writer.add_scalar("loss/fgfi", (lfgfi / batch_size).item(), global_step)
                 writer.add_scalar("loss/total", loss.item(), global_step)
 
                 if RANK != -1:
