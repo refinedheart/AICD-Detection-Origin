@@ -3,11 +3,11 @@
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from models.common import Concat
 from utils.metrics import bbox_iou
 from utils.torch_utils import de_parallel
-import torch.nn.functional as F
-from models.common import Concat
 
 
 def smooth_BCE(eps=0.1):
@@ -144,25 +144,25 @@ class ComputeLoss:
         self.device = device
 
         self.teacher_model = teacher_model
-        self.teacher_model.float()     # 强制 teacher 用 FP32
+        self.teacher_model.float()  # 强制 teacher 用 FP32
         self.distill_ok = self.teacher_model is not None
         if self.distill_ok:
-            # 1. freezs teacher model
+            # 1. freezes teacher model
             for param in self.teacher_model.parameters():
                 param.requires_grad = False
             self.teacher_model.eval()
             de_parallel(self.teacher_model).model[-1].train()
             # 2. 蒸馏超参数（从 hyp 读取，方便调优）
             # 1. 稍微提高总开关权重，让蒸馏起效
-            self.distill_w = h.get("distill_w", 1.0) 
+            self.distill_w = h.get("distill_w", 1.0)
             # 2. 温度稍微调高一点点，使软标签更平滑
-            self.distill_temp = h.get("distill_temp", 3.0) 
+            self.distill_temp = h.get("distill_temp", 3.0)
 
             self.distill_box_w = 0.05  # 降低框权重
-            self.distill_cls_w = 0.5   # 提高分类权重
-            self.distill_obj_w = 1.0   # 提高置信度权重
+            self.distill_cls_w = 0.5  # 提高分类权重
+            self.distill_obj_w = 1.0  # 提高置信度权重
 
-            self.distill_cls_criterion = nn.KLDivLoss(reduction="batchmean") # 推荐用 batchmean
+            self.distill_cls_criterion = nn.KLDivLoss(reduction="batchmean")  # 推荐用 batchmean
             self.distill_box_criterion = nn.MSELoss(reduction="mean")
             # [重要修改] 置信度改用 BCE，梯度更健康
             self.distill_obj_criterion = nn.BCEWithLogitsLoss(reduction="mean")
@@ -180,59 +180,57 @@ class ComputeLoss:
             with torch.no_grad():
                 s_feats = self._get_intermediate_feats(self.model, dummy_img, self.student_feat_layers)
                 student_channels = [f.shape[1] for f in s_feats]
-                
+
                 t_feats = self._get_intermediate_feats(self.teacher_model, dummy_img, self.teacher_feat_layers)
                 teacher_channels = [f.shape[1] for f in t_feats]
-            
+
             print(f"Distillation Channels detected: Student={student_channels}, Teacher={teacher_channels}")
 
-            
             # 3. 传入计算好的通道数
             self.feat_projectors = self._build_feat_projectors(student_channels, teacher_channels)
 
     def _build_feat_projectors(self, s_channels, t_channels):
-        """构建特征通道投影器（v5l 特征通道数 → v5s 特征通道数，因为 v5l 通道数是 v5s 的 2 倍）"""
+        """构建特征通道投影器（v5l 特征通道数 → v5s 特征通道数，因为 v5l 通道数是 v5s 的 2 倍）."""
         projectors = []
-        
-        
+
         for t_ch, s_ch in zip(t_channels, s_channels):
             # 1x1 卷积降维 + BatchNorm
             projector = nn.Sequential(
-                nn.Conv2d(t_ch, s_ch, kernel_size=1, stride=1, padding=0, bias=False),
-                nn.BatchNorm2d(s_ch)
+                nn.Conv2d(t_ch, s_ch, kernel_size=1, stride=1, padding=0, bias=False), nn.BatchNorm2d(s_ch)
             ).to(self.device)
             nn.init.xavier_uniform_(projector[0].weight)
             projectors.append(projector)
-        return nn.ModuleList(projectors) # 建议使用 ModuleList 以便正确注册参数
+        return nn.ModuleList(projectors)  # 建议使用 ModuleList 以便正确注册参数
 
     def _get_intermediate_feats(self, model, x, layer_indices):
-        """获取模型中间层特征（适配 YOLOv5 结构，跳过 Concat 等多输入模块）"""
+        """获取模型中间层特征（适配 YOLOv5 结构，跳过 Concat 等多输入模块）."""
         feats = []
-        
+
         # 假设 Concat 模块已经被导入 (见步骤 1)
-        
+
         for idx, m in enumerate(model.model):
             # 检查模块类型，如果是 Concat 模块，则跳过前向传播
             # 否则，Concat 模块的输入 x 此时是一个 Tensor 而非 Tensor 列表，会导致 TypeError: cat()
-            if isinstance(m, Concat): 
-                continue # 跳过 Concat 模块，继续下一个模块
-            
+            if isinstance(m, Concat):
+                continue  # 跳过 Concat 模块，继续下一个模块
+
             # 前向传播到当前层（只针对单输入模块：Conv, C3, SPPF 等）
-            x = m(x)  
-            
+            x = m(x)
+
             # 保存特征
             if idx in layer_indices:
                 feats.append(x)
-                
+
             if idx == layer_indices[-1]:  # 到最后一个特征层后停止，提升效率
                 break
         return feats
+
     def __call__(self, p, targets, imgs=None):  # predictions, targets
         """Performs forward pass, calculating class, box, and object loss for given predictions and targets."""
         lcls = torch.zeros(1, device=self.device)  # class loss
         lbox = torch.zeros(1, device=self.device)  # box loss
         lobj = torch.zeros(1, device=self.device)  # object loss
-        ldistill = torch.zeros(1, device=self.device) 
+        ldistill = torch.zeros(1, device=self.device)
         lfeat_distill = torch.zeros(1, device=self.device)
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
 
@@ -278,7 +276,7 @@ class ComputeLoss:
 
             with torch.no_grad():
                 # teacher forward 固定 FP32，并显式关掉 autocast
-                with torch.amp.autocast('cuda', enabled=False):
+                with torch.amp.autocast("cuda", enabled=False):
                     teacher_p = self.teacher_model(imgs_fp32)
 
                     # 教师中间特征（同样在 FP32 下）
@@ -287,7 +285,6 @@ class ComputeLoss:
                             self.teacher_model, imgs_fp32, self.teacher_feat_layers
                         )
             for i, (student_pi, teacher_pi) in enumerate(zip(p, teacher_p)):
-                
                 b, a, gj, gi = indices[i]
                 n = b.shape[0]
                 if n == 0:
@@ -303,43 +300,49 @@ class ComputeLoss:
                 t_obj = teacher_pi[b, a, gj, gi, 4:5]  # 教师置信度（logits）
 
                 # 3.2 框回归蒸馏（对齐解码后的真实框位置）
-                s_box = torch.cat([
-                    s_pxy.sigmoid() * 2 - 0.5,
-                    (s_pwh.sigmoid() * 2) ** 2 * anchors[i]
-                ], 1)
-                t_box = torch.cat([
-                    t_pxy.sigmoid() * 2 - 0.5,
-                    (t_pwh.sigmoid() * 2) ** 2 * anchors[i]
-                ], 1)
+                s_box = torch.cat([s_pxy.sigmoid() * 2 - 0.5, (s_pwh.sigmoid() * 2) ** 2 * anchors[i]], 1)
+                t_box = torch.cat([t_pxy.sigmoid() * 2 - 0.5, (t_pwh.sigmoid() * 2) ** 2 * anchors[i]], 1)
                 distill_box_loss = self.distill_box_criterion(s_box, t_box) * self.distill_box_w
 
                 # 3.3 分类蒸馏（KL散度 + 温度平滑，适配软标签）
                 s_cls_logsoftmax = F.log_softmax(s_pcls / self.distill_temp, dim=-1)
                 t_cls_softmax = F.softmax(t_pcls / self.distill_temp, dim=-1)
                 # 乘温度平方：抵消 KL 散度在高温度下的损失缩放（参考蒸馏原论文）
-                distill_cls_loss = self.distill_cls_criterion(s_cls_logsoftmax, t_cls_softmax) * (self.distill_temp ** 2) * self.distill_cls_w
+                distill_cls_loss = (
+                    self.distill_cls_criterion(s_cls_logsoftmax, t_cls_softmax)
+                    * (self.distill_temp**2)
+                    * self.distill_cls_w
+                )
 
                 # 3.4 置信度蒸馏（对齐 sigmoid 后的概率）
-                distill_obj_loss = self.distill_obj_criterion(
-                    s_obj, torch.sigmoid(t_obj)
-                ) * self.distill_obj_w
+                distill_obj_loss = self.distill_obj_criterion(s_obj, torch.sigmoid(t_obj)) * self.distill_obj_w
 
                 # 3.5 累加该层输出蒸馏损失
                 ldistill += (distill_box_loss + distill_cls_loss + distill_obj_loss) / 3  # 平均三项
 
             # 4. 中间层特征蒸馏（对齐学生与教师的特征分布）
             # if self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
-                # 获取学生中间层特征
+            # 获取学生中间层特征
             #     student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs, self.student_feat_layers)
             # 只在训练阶段做特征蒸馏（val/test 禁用）
-            if self.model.training and self.feat_distill_enabled and len(teacher_feats) == len(self.student_feat_layers):
-                student_feats = self._get_intermediate_feats(de_parallel(self.model), imgs_fp32, self.student_feat_layers)
+            if (
+                self.model.training
+                and self.feat_distill_enabled
+                and len(teacher_feats) == len(self.student_feat_layers)
+            ):
+                student_feats = self._get_intermediate_feats(
+                    de_parallel(self.model), imgs_fp32, self.student_feat_layers
+                )
 
                 # 逐特征层计算蒸馏损失（MSE 对齐特征图）
-                for idx, (s_feat, t_feat, projector) in enumerate(zip(student_feats, teacher_feats, self.feat_projectors)):
+                for idx, (s_feat, t_feat, projector) in enumerate(
+                    zip(student_feats, teacher_feats, self.feat_projectors)
+                ):
                     t_feat_proj = projector(t_feat)
                     if s_feat.shape[2:] != t_feat_proj.shape[2:]:
-                        t_feat_proj = F.interpolate(t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False)
+                        t_feat_proj = F.interpolate(
+                            t_feat_proj, size=s_feat.shape[2:], mode="bilinear", align_corners=False
+                        )
                     # 累加特征蒸馏损失
                     lfeat_distill += F.mse_loss(s_feat, t_feat_proj)
 
